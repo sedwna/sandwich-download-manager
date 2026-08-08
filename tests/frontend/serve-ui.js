@@ -91,7 +91,17 @@ createServer(async (request, response) => {
             window.__sandwichBatches = (window.__sandwichBatches ?? []).concat(queued);
             return { batch_id: batchId, name, queued, failed: [] };
           }
-          if (command === "control_batch") return [];
+          if (command === "control_batch") {
+            // Mirrors the real shape: only confirmed removals are reported gone, so the UI can
+            // be tested against a cancel that half succeeds.
+            const members = (window.__sandwichBatchMembers ?? []).filter((m) => m.batch_id === payload.batchId);
+            if (payload.action !== "cancel") return { removed: [], updated: [] };
+            const stubborn = new Set(window.__sandwichUncancellable ?? []);
+            return {
+              removed: members.filter((m) => !stubborn.has(m.id)).map((m) => m.id),
+              updated: members.filter((m) => stubborn.has(m.id))
+            };
+          }
           if (command === "list_downloads") return [
             { id: "active-1", filename: "ubuntu-24.04.iso", status: "active", completed_bytes: 5242880, total_bytes: 10485760, bytes_per_second: 1048576, eta_seconds: 5, connections: 8, num_pieces: 40, bitfield: "ffffe000000000000000", source_url: "https://releases.example.com/ubuntu-24.04.iso", directory: "C:\\Users\\Tester\\Downloads" },
             { id: "paused-1", filename: "album.flac", status: "paused", completed_bytes: 1048576, total_bytes: 4194304, bytes_per_second: 0, connections: 0, num_pieces: 16, bitfield: "f000", source_url: "https://music.example.com/album.flac", directory: "C:\\Users\\Tester\\Downloads" },

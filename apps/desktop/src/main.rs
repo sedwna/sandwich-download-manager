@@ -459,12 +459,25 @@ async fn submit_batch(
 /// The whole reason a batch exists: stopping a fifty-part download should be one action, not
 /// fifty. Resuming marks each member as a deliberate start so the download window does not undo
 /// it on the next tick, matching what a single resume does.
+/// What a batch action changed: which members are gone, and the state of those that remain.
+///
+/// Both halves are needed because a cancel can half-succeed. Reporting only "the batch is gone"
+/// would leave the interface hiding a transfer that is still running.
+#[derive(Clone, Serialize)]
+struct BatchControlResult {
+    removed: Vec<String>,
+    updated: Vec<Snapshot>,
+}
+
 #[tauri::command]
 async fn control_batch(
     state: State<'_, AppState>,
     batch_id: String,
     action: String,
-) -> Result<Vec<Snapshot>, String> {
+) -> Result<BatchControlResult, String> {
+    if !matches!(action.as_str(), "pause" | "resume" | "cancel") {
+        return Err("unsupported batch action".into());
+    }
     let engine = state.engine()?;
     let members: Vec<String> = state
         .batches
@@ -473,6 +486,7 @@ async fn control_batch(
         .and_then(|store| store.get(&batch_id).map(|batch| batch.gids.clone()))
         .ok_or_else(|| "that batch is no longer in the queue".to_owned())?;
 
+    let mut removed = HashSet::new();
     for gid in &members {
         let Ok(status) = engine.status(gid).await else {
             continue;
@@ -490,26 +504,32 @@ async fn control_batch(
                     store.allow(gid);
                 }
             }
+            // Only a cancel the engine actually accepted counts. One that failed leaves a
+            // transfer running, and dropping it from the batch anyway would strand it: still
+            // downloading, no longer part of anything the user can stop in one action.
             "cancel" => {
-                let _ = engine.cancel(gid).await;
-                if let Ok(mut store) = state.held.lock() {
-                    store.forget(gid);
+                if engine.cancel(gid).await.is_ok() {
+                    removed.insert(gid.clone());
+                    if let Ok(mut store) = state.held.lock() {
+                        store.forget(gid);
+                    }
                 }
             }
-            "pause" | "resume" => {}
-            _ => return Err("unsupported batch action".into()),
+            _ => {}
         }
     }
 
-    if action == "cancel" {
+    if !removed.is_empty() {
         if let Ok(mut store) = state.batches.lock() {
-            store.forget(&batch_id);
+            store.remove_members(&batch_id, &removed);
         }
-        return Ok(Vec::new());
     }
 
     let mut updated = Vec::new();
     for gid in &members {
+        if removed.contains(gid) {
+            continue;
+        }
         if let Ok(status) = engine.status(gid).await {
             updated.push(stamped(
                 to_snapshot(&status),
@@ -519,7 +539,10 @@ async fn control_batch(
             ));
         }
     }
-    Ok(updated)
+    Ok(BatchControlResult {
+        removed: removed.into_iter().collect(),
+        updated,
+    })
 }
 
 #[tauri::command]

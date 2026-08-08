@@ -318,31 +318,53 @@ async function runBatchAction(item, action, label) {
       toast("Nothing in this batch has failed", { tone: "info" });
       return;
     }
+    let restarted = 0;
     for (const member of broken) {
       try {
         const updated = await bridge.invoke("control_download", { downloadId: member.id, action: "retry" });
         downloads = downloads.filter((entry) => entry.id !== member.id);
         downloads.unshift(updated);
+        restarted += 1;
       } catch { /* one part that will not restart must not stop the others */ }
     }
     render();
-    const message = `Retrying ${broken.length} failed file${broken.length === 1 ? "" : "s"} in ${item.filename}`;
+    // Report what happened, not what was attempted. "Retrying 3 failed files" while all three
+    // stayed failed is worse than saying nothing.
+    if (restarted === 0) {
+      const message = `Could not restart any of the ${broken.length} failed file${broken.length === 1 ? "" : "s"} in ${item.filename}`;
+      elements.queueStatus.textContent = `${message}.`;
+      toast(message, { tone: "error" });
+      return;
+    }
+    const message = `Retrying ${restarted} failed file${restarted === 1 ? "" : "s"} in ${item.filename}`;
     elements.queueStatus.textContent = `${message}.`;
     toast(message, { tone: "info" });
     return;
   }
 
-  const updated = await bridge.invoke("control_batch", { batchId: item.batch_id, action });
+  const result = await bridge.invoke("control_batch", { batchId: item.batch_id, action });
+  // Only what the engine confirmed is gone leaves the list. A cancel that half succeeded leaves
+  // the survivors on screen rather than hiding transfers that are still running.
+  const gone = new Set(result?.removed ?? []);
+  if (gone.size > 0) downloads = downloads.filter((entry) => !gone.has(entry.id));
+  for (const snapshot of result?.updated ?? []) {
+    const index = downloads.findIndex((entry) => entry.id === snapshot.id);
+    if (index < 0) downloads.unshift(snapshot); else downloads[index] = snapshot;
+  }
+  render();
+
   if (action === "cancel") {
-    const gone = new Set(item.members.map((member) => member.id));
-    downloads = downloads.filter((entry) => !gone.has(entry.id));
-    render();
+    const stranded = item.members.length - gone.size;
+    if (stranded > 0) {
+      const message = `${stranded} file${stranded === 1 ? "" : "s"} in ${item.filename} could not be cancelled`;
+      elements.queueStatus.textContent = `${message}.`;
+      toast(message, { tone: "error" });
+      return;
+    }
     elements.queueStatus.textContent = `${item.filename} removed from the list.`;
     toast(`Cancelled ${item.filename}`, { tone: "info" });
     return;
   }
-  for (const snapshot of updated ?? []) mergeDownload(snapshot);
-  render();
   elements.queueStatus.textContent = `${item.filename}: ${label.toLowerCase()}.`;
 }
 
@@ -357,8 +379,13 @@ function actionButton(label, action, item) {
 
     // Killing a live transfer throws away real progress, so it gets a question first.
     // Removing an already-dead entry only clears a line from a list; asking would be nagging.
-    const live = ["active", "queued", "paused", "recoverably_interrupted"].includes(item.status);
-    if (action === "cancel" && (live || item.isBatch)) {
+    // A batch is live if anything in it still is. Asking "this will stop" about a batch whose
+    // parts have all failed is the same nagging the single-download path deliberately skips.
+    const runnable = (status) => ["active", "queued", "paused", "recoverably_interrupted"].includes(status);
+    const live = item.isBatch
+      ? item.members.some((member) => runnable(member.status))
+      : runnable(item.status);
+    if (action === "cancel" && live) {
       // Cancelling a batch throws away the progress of every part at once, so it says how many
       // and how much rather than asking about "this download" as though it were one file.
       const sure = await confirmDialog({
@@ -446,49 +473,77 @@ function createCard(item) {
  * grouping exists to prevent. Only a broken part gets a control, because a broken part is the
  * only one a person needs to do something about individually.
  */
-function renderMembers(entry, item) {
-  entry.memberList.replaceChildren(...item.members.map((member) => {
-    const row = document.createElement("li");
-    row.className = "member";
-    row.dataset.status = member.status;
+function buildMemberRow(entry, member) {
+  const row = document.createElement("li");
+  row.className = "member";
 
-    const name = document.createElement("span");
-    name.className = "member-name";
-    name.textContent = member.filename;
-    name.title = member.source_url || member.filename;
+  const name = document.createElement("span");
+  name.className = "member-name";
 
-    const state = document.createElement("span");
-    state.className = "member-state";
-    state.textContent = member.status === "active"
-      ? `${Math.round(progressPercent(member.completed_bytes, member.total_bytes))}%`
-      : statusLabel(member);
+  const state = document.createElement("span");
+  state.className = "member-state";
 
-    row.append(name, state);
-
-    if (["failed", "cancelled"].includes(member.status)) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "quiet member-retry";
-      retry.textContent = "Retry";
-      retry.setAttribute("aria-label", `Retry ${member.filename}`);
-      retry.addEventListener("click", async () => {
-        retry.disabled = true;
-        try {
-          const updated = await bridge.invoke("control_download", { downloadId: member.id, action: "retry" });
-          downloads = downloads.filter((existing) => existing.id !== member.id);
-          downloads.unshift(updated);
-          render();
-          toast(`Retrying ${member.filename}`, { tone: "info" });
-        } catch (error) {
-          toast(`Could not retry ${member.filename}: ${error.message ?? error}`, { tone: "error" });
-        } finally {
-          if (retry.isConnected) retry.disabled = false;
-        }
-      });
-      row.append(retry);
+  // Always present, hidden until it is needed. Adding and removing it as parts fail and recover
+  // would destroy the button under a keyboard user's finger on the next poll.
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "quiet member-retry";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", async () => {
+    const target = row.dataset.id;
+    retry.disabled = true;
+    try {
+      const updated = await bridge.invoke("control_download", { downloadId: target, action: "retry" });
+      downloads = downloads.filter((existing) => existing.id !== target);
+      downloads.unshift(updated);
+      render();
+      toast(`Retrying ${row.dataset.filename}`, { tone: "info" });
+    } catch (error) {
+      toast(`Could not retry ${row.dataset.filename}: ${error.message ?? error}`, { tone: "error" });
+    } finally {
+      if (retry.isConnected) retry.disabled = false;
     }
-    return row;
-  }));
+  });
+
+  row.append(name, state, retry);
+  entry.memberRows.set(member.id, { row, name, state, retry });
+  return row;
+}
+
+function updateMemberRow(parts, member) {
+  const { row, name, state, retry } = parts;
+  row.dataset.status = member.status;
+  row.dataset.id = member.id;
+  row.dataset.filename = member.filename;
+  name.textContent = member.filename;
+  name.title = member.source_url || member.filename;
+  state.textContent = member.status === "active"
+    ? `${Math.round(progressPercent(member.completed_bytes, member.total_bytes))}%`
+    : statusLabel(member);
+  retry.hidden = !["failed", "cancelled"].includes(member.status);
+  retry.setAttribute("aria-label", `Retry ${member.filename}`);
+}
+
+/**
+ * Lists a batch's parts inside its expanded card.
+ *
+ * Compact rows rather than nested cards: fifty full cards inside one card is the mess the
+ * grouping exists to prevent. Reconciled in place for the same reason the queue itself is —
+ * rebuilding fifty rows twice a second would throw away the row a keyboard user is standing on,
+ * and their click would never land.
+ */
+function renderMembers(entry, item) {
+  entry.memberRows ??= new Map();
+  const key = item.members.map((member) => member.id).join("|");
+  if (entry.memberKey !== key) {
+    entry.memberRows = new Map();
+    entry.memberList.replaceChildren(...item.members.map((member) => buildMemberRow(entry, member)));
+    entry.memberKey = key;
+  }
+  for (const member of item.members) {
+    const parts = entry.memberRows.get(member.id);
+    if (parts) updateMemberRow(parts, member);
+  }
 }
 
 function updateCard(entry, item) {
@@ -558,10 +613,18 @@ function updateCard(entry, item) {
   if (isOpen) {
     entry.detailUrl.textContent = item.source_url || "—";
     entry.detailDir.textContent = item.directory || "—";
-    entry.detailPieces.textContent = item.num_pieces
-      ? `${item.num_pieces} × ${formatBytes(Math.round(item.total_bytes / item.num_pieces))}`
-      : "—";
-    entry.detailResume.textContent = item.num_pieces > 1 ? "Supported" : "Not reported";
+    // Pieces and resume describe one transfer's segmentation. On a batch they would report the
+    // member count as chunk sizes — "50 × 0 B" whenever a part has not declared its size — and
+    // claim a resume guarantee for a set rather than a file. The member list below says
+    // everything true about a batch's shape, so these two rows stand down for it.
+    entry.detailPieces.closest("div").hidden = Boolean(item.isBatch);
+    entry.detailResume.closest("div").hidden = Boolean(item.isBatch);
+    if (!item.isBatch) {
+      entry.detailPieces.textContent = item.num_pieces
+        ? `${item.num_pieces} × ${formatBytes(Math.round(item.total_bytes / item.num_pieces))}`
+        : "—";
+      entry.detailResume.textContent = item.num_pieces > 1 ? "Supported" : "Not reported";
+    }
     entry.detailRawRow.hidden = !item.error?.message;
     entry.detailRaw.textContent = item.error?.message ?? "";
     if (item.isBatch) renderMembers(entry, item);
@@ -906,6 +969,11 @@ function setIntakeMode(mode) {
   const many = mode === "many";
   elements.manyMode.hidden = !many;
   elements.singleMode.hidden = many;
+  // Disabled, not merely hidden. #url is type="url", so a half-typed address left behind in it
+  // would fail the form's constraint validation on submit — and because the field is hidden the
+  // browser cannot show the user what it is complaining about. The submit event never fires and
+  // adding a batch appears to do nothing at all.
+  elements.url.disabled = many;
   elements.modeMany.classList.toggle("is-selected", many);
   elements.modeSingle.classList.toggle("is-selected", !many);
   elements.modeMany.setAttribute("aria-pressed", String(many));
@@ -928,12 +996,22 @@ let batchPreview = null;
 
 async function refreshBatchPreview() {
   const input = elements.batchInput.value;
+  let unreachable = false;
   try {
     batchPreview = await bridge.invoke("preview_batch", { input });
   } catch {
     batchPreview = null;
+    unreachable = true;
   }
-  const summary = describePreview(batchPreview);
+  // A backend that cannot answer is not the same as an empty box. Telling someone who just
+  // pasted fifty links that there are none hides the real fault and reads as their mistake.
+  const summary = unreachable
+    ? {
+        tone: "error",
+        headline: "Could not check those links",
+        detail: "The download engine is not responding, so the list cannot be prepared yet."
+      }
+    : describePreview(batchPreview);
   elements.batchHeadline.textContent = summary.headline;
   elements.batchDetail.textContent = summary.detail;
   elements.batchState.dataset.tone = summary.tone;
@@ -986,7 +1064,11 @@ elements.form.addEventListener("submit", async (event) => {
   } catch (error) {
     showError(error.message ?? String(error));
   } finally {
-    submit.disabled = false;
+    // The batch button's enabled state belongs to the preview, which a successful submit has
+    // just reset for an empty box. Clearing the flag unconditionally would leave "Add batch"
+    // live beside an empty textarea, and a second click would submit nothing.
+    if (intakeMode === "many") elements.submitBatch.disabled = !batchPreview?.links?.length;
+    else elements.submitSingle.disabled = false;
   }
 });
 

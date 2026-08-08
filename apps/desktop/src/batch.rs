@@ -326,12 +326,22 @@ impl BatchStore {
         }
     }
 
-    pub fn forget(&mut self, id: &str) {
-        let before = self.batches.len();
-        self.batches.retain(|batch| batch.id != id);
-        if self.batches.len() != before {
-            self.save();
+    /// Drops the named members, and the batch itself once nothing is left in it.
+    ///
+    /// Returns the members that remain. A cancel that only half succeeded must leave the batch
+    /// holding the survivors: forgetting it wholesale would leave a transfer still running with
+    /// nothing recording that it belongs to anything.
+    pub fn remove_members(&mut self, id: &str, gone: &HashSet<String>) -> Vec<String> {
+        let Some(batch) = self.batches.iter_mut().find(|batch| batch.id == id) else {
+            return Vec::new();
+        };
+        batch.gids.retain(|gid| !gone.contains(gid));
+        let remaining = batch.gids.clone();
+        if remaining.is_empty() {
+            self.batches.retain(|batch| batch.id != id);
         }
+        self.save();
+        remaining
     }
 
     /// Drops members the engine no longer knows, and any batch left with none.
@@ -555,6 +565,28 @@ mod tests {
         let members = &reloaded.get(&batch.id).unwrap().gids;
         assert_eq!(members, &vec!["g9".to_owned(), "g2".to_owned()]);
         assert_eq!(reloaded.batch_of("g9").unwrap().id, batch.id);
+    }
+
+    #[test]
+    fn a_half_successful_cancel_leaves_the_batch_holding_the_survivors() {
+        // If one cancel fails, that transfer carries on. Forgetting the whole batch would leave
+        // it running with nothing recording what it belongs to.
+        let dir = scratch("remove-members");
+        let mut store = BatchStore::load(&dir);
+        let batch = store.create("game", vec!["g1".into(), "g2".into(), "g3".into()]);
+
+        let remaining = store.remove_members(&batch.id, &HashSet::from(["g1".to_owned()]));
+        assert_eq!(remaining, vec!["g2".to_owned(), "g3".to_owned()]);
+        assert!(store.batch_of("g2").is_some());
+        assert!(store.batch_of("g1").is_none());
+
+        // Only once the last one goes does the batch go with it.
+        let empty = store.remove_members(
+            &batch.id,
+            &HashSet::from(["g2".to_owned(), "g3".to_owned()]),
+        );
+        assert!(empty.is_empty());
+        assert!(store.get(&batch.id).is_none());
     }
 
     #[test]

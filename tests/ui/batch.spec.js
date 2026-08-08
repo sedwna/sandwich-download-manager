@@ -8,6 +8,7 @@ const FIXTURE = "/index.html?fixture";
 
 async function seed(page, downloads) {
   await page.evaluate((items) => {
+    window.__sandwichBatchMembers = items.filter((item) => item.batch_id);
     const original = window.__SANDWICH_TEST_BRIDGE__.invoke;
     window.__SANDWICH_TEST_BRIDGE__.invoke = async (command, payload) =>
       command === "list_downloads" ? items : original(command, payload);
@@ -140,8 +141,9 @@ test("expanding a batch lists its parts, and only broken ones get a control", as
   const members = page.locator(".member-list .member");
   await expect(members).toHaveCount(6);
   await expect(members.first()).toContainText("Cyberpunk.part01.rar");
-  // One retry, for the one failed part — not six.
-  await expect(page.locator(".member-retry")).toHaveCount(1);
+  // One offered retry, for the one failed part — not six. The control exists on every row so
+  // that focus survives a poll, but it is only shown where it means something.
+  await expect(page.locator(".member-retry:not([hidden])")).toHaveCount(1);
 });
 
 test("batch actions act on the whole set", async ({ page }) => {
@@ -183,6 +185,95 @@ test("a loose download beside a batch stays its own card", async ({ page }) => {
   ]);
   await expect(page.locator(".download-card")).toHaveCount(2);
   await expect(page.locator(".download-card .filename")).toContainText(["Cyberpunk", "holiday.mp4"]);
+});
+
+/* ── Ways this went wrong in review ──────────────────────────────────────── */
+
+test("a half-typed URL left in the other mode does not silently block the batch", async ({ page }) => {
+  // #url is type="url". Left holding an invalid value it fails the form's constraint check on
+  // submit, and because it is hidden the browser cannot show what it is complaining about —
+  // the submit event never fires and Add batch appears to do nothing at all.
+  await page.locator("#open-add").click();
+  await page.locator("#url").fill("not-a-url");
+  await page.locator("#mode-many").click();
+  await page.locator("#batch-input").fill("https://cdn.example.com/a[1-3].rar");
+  await expect(page.locator("#submit-batch")).toBeEnabled();
+
+  await page.locator("#submit-batch").click();
+  // Reaching the destination complaint proves the submit handler ran at all.
+  await expect(page.locator("#form-error")).toContainText(/destination folder/i);
+});
+
+test("focus survives a refresh while a batch is expanded", async ({ page }) => {
+  // The same defect the queue itself was fixed for once: rebuilding every row on each poll
+  // throws away the button under a keyboard user's finger.
+  await seed(page, parts({ count: 6, done: 2, failed: 1 }));
+  await page.locator(".download-card .disclosure").first().click();
+
+  const retry = page.locator(".member-retry:not([hidden])").first();
+  await retry.focus();
+  const before = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
+
+  await page.evaluate(() => window.__sandwichRefresh());
+  await page.waitForTimeout(200);
+
+  const after = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
+  expect(after).toBe(before);
+  expect(after).not.toBeNull();
+});
+
+test("a batch with nothing left running is removed without being asked about", async ({ page }) => {
+  // "This will stop" about a batch whose parts have all failed is the nagging the
+  // single-download path deliberately skips.
+  const dead = parts({ count: 4 }).map((member) => ({ ...member, status: "failed" }));
+  await seed(page, dead);
+  const card = page.locator(".download-card").first();
+  await expect(card.getByRole("button", { name: /Remove all/ })).toBeVisible();
+  await card.getByRole("button", { name: /Remove all/ }).click();
+  await expect(page.locator("#app-dialog")).toBeHidden();
+});
+
+test("a cancel that only half succeeds keeps the survivors on screen", async ({ page }) => {
+  await seed(page, parts({ count: 4 }));
+  // Two parts the engine will not let go of.
+  await page.evaluate(() => { window.__sandwichUncancellable = ["b1-2", "b1-3"]; });
+
+  await page.locator(".download-card").first().getByRole("button", { name: /Cancel all/ }).click();
+  await page.locator("#app-dialog").getByRole("button", { name: /Cancel the batch/ }).click();
+
+  // Hiding a transfer that is still running would be worse than the failed cancel itself.
+  await expect(page.locator(".download-card")).toHaveCount(1);
+  await expect(page.locator(".toast")).toContainText(/2 files .* could not be cancelled/i);
+});
+
+test("the expanded batch does not claim a piece size it cannot know", async ({ page }) => {
+  // num_pieces carries the member count on a batch, so the single-download reading of it
+  // produces "50 x 0 B" the moment any part has not declared a size.
+  const unsized = parts({ count: 5 }).map((member, index) =>
+    index === 0 ? { ...member, total_bytes: 0 } : member
+  );
+  await seed(page, [
+    ...unsized,
+    {
+      id: "loose", filename: "holiday.mp4", status: "active",
+      completed_bytes: 100, total_bytes: 1000, bytes_per_second: 50,
+      connections: 1, num_pieces: 4, bitfield: "0",
+      source_url: "https://example.com/holiday.mp4", directory: "C:\\Downloads"
+    }
+  ]);
+
+  const batchCard = page.locator(".download-card").first();
+  await batchCard.locator(".disclosure").click();
+  await expect(batchCard.locator(".detail-pieces")).toBeHidden();
+  await expect(batchCard.locator(".detail-resume")).toBeHidden();
+  await expect(page.locator(".member-list .member")).toHaveCount(5);
+
+  // And they still mean something on an ordinary download, so this is a batch exemption
+  // rather than the rows being removed for everyone.
+  const looseCard = page.locator(".download-card").nth(1);
+  await looseCard.locator(".disclosure").click();
+  await expect(looseCard.locator(".detail-pieces")).toBeVisible();
+  await expect(looseCard.locator(".detail-resume")).toBeVisible();
 });
 
 test("a batch held for the download window says so once, not fifty times", async ({ page }) => {
