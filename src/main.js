@@ -1,4 +1,5 @@
 import {
+  aggregateStatus, batchProgressLabel, batchTotals, describePreview,
   WEEKDAYS, clockToMinutes, dateGroup, describeError, formatBytes, formatEta, minutesToClock,
   orderedCells, progressPercent, scheduleSummary, sourceHost, speedLimitBytes, speedLimitParts,
   statusLabel
@@ -74,7 +75,21 @@ const elements = {
   scheduleDetail: document.querySelector("#schedule-detail"),
   scheduleError: document.querySelector("#schedule-error"),
   schedulePill: document.querySelector("#schedule-pill"),
-  schedulePillText: document.querySelector("#schedule-pill-text")
+  schedulePillText: document.querySelector("#schedule-pill-text"),
+  modeSingle: document.querySelector("#mode-single"),
+  modeMany: document.querySelector("#mode-many"),
+  singleMode: document.querySelector("#single-mode"),
+  manyMode: document.querySelector("#many-mode"),
+  batchInput: document.querySelector("#batch-input"),
+  batchName: document.querySelector("#batch-name"),
+  batchState: document.querySelector("#batch-state"),
+  batchHeadline: document.querySelector("#batch-headline"),
+  batchDetail: document.querySelector("#batch-detail"),
+  batchRejects: document.querySelector("#batch-rejects"),
+  batchRejectsSummary: document.querySelector("#batch-rejects-summary"),
+  batchRejectList: document.querySelector("#batch-reject-list"),
+  submitBatch: document.querySelector("#submit-batch"),
+  submitSingle: document.querySelector("#submit-single")
 };
 
 /* ── Theme ──────────────────────────────────────────────────────────────── */
@@ -222,6 +237,16 @@ function renderStack(container, item) {
 
 function actionsFor(item) {
   const status = item.status;
+  // A batch is acted on as one thing — that is the whole reason it is one card. Per-part
+  // recovery lives on the member rows inside it, where a single broken part can be retried
+  // without touching the other forty-nine.
+  if (item.isBatch) {
+    if (["queued", "active"].includes(status)) return [["Pause all", "pause"], ["Cancel all", "cancel"]];
+    if (item.scheduled && status === "paused") return [["Start all now", "resume"], ["Cancel all", "cancel"]];
+    if (status === "paused") return [["Resume all", "resume"], ["Cancel all", "cancel"]];
+    if (status === "completed") return [["Show in folder", "reveal"]];
+    return [["Retry failed", "retry"], ["Remove all", "cancel"]];
+  }
   if (["queued", "active"].includes(status)) return [["Pause", "pause"], ["Cancel", "cancel"]];
   // Held by the schedule rather than by the user: "Resume" would answer a question nobody
   // asked, where "Start now" names the thing the button actually does — override the window
@@ -272,6 +297,55 @@ async function openDownloadTarget(item, reveal) {
   }
 }
 
+/**
+ * Carries out a batch-level action.
+ *
+ * Pause, resume and cancel are one call because the backend owns the group. "Retry failed" is
+ * deliberately not: it re-queues each broken part through the ordinary single-download path, so
+ * a retried part gets the same policy, destination and scheduling treatment as any other — and
+ * the backend keeps it in the batch by swapping the id in place.
+ */
+async function runBatchAction(item, action, label) {
+  if (action === "reveal") {
+    const anywhere = item.members.find((member) => member.status === "completed") ?? item.members[0];
+    await openDownloadTarget(anywhere, true);
+    return;
+  }
+
+  if (action === "retry") {
+    const broken = item.members.filter((member) => ["failed", "cancelled"].includes(member.status));
+    if (broken.length === 0) {
+      toast("Nothing in this batch has failed", { tone: "info" });
+      return;
+    }
+    for (const member of broken) {
+      try {
+        const updated = await bridge.invoke("control_download", { downloadId: member.id, action: "retry" });
+        downloads = downloads.filter((entry) => entry.id !== member.id);
+        downloads.unshift(updated);
+      } catch { /* one part that will not restart must not stop the others */ }
+    }
+    render();
+    const message = `Retrying ${broken.length} failed file${broken.length === 1 ? "" : "s"} in ${item.filename}`;
+    elements.queueStatus.textContent = `${message}.`;
+    toast(message, { tone: "info" });
+    return;
+  }
+
+  const updated = await bridge.invoke("control_batch", { batchId: item.batch_id, action });
+  if (action === "cancel") {
+    const gone = new Set(item.members.map((member) => member.id));
+    downloads = downloads.filter((entry) => !gone.has(entry.id));
+    render();
+    elements.queueStatus.textContent = `${item.filename} removed from the list.`;
+    toast(`Cancelled ${item.filename}`, { tone: "info" });
+    return;
+  }
+  for (const snapshot of updated ?? []) mergeDownload(snapshot);
+  render();
+  elements.queueStatus.textContent = `${item.filename}: ${label.toLowerCase()}.`;
+}
+
 function actionButton(label, action, item) {
   const button = document.createElement("button");
   button.type = "button";
@@ -284,11 +358,15 @@ function actionButton(label, action, item) {
     // Killing a live transfer throws away real progress, so it gets a question first.
     // Removing an already-dead entry only clears a line from a list; asking would be nagging.
     const live = ["active", "queued", "paused", "recoverably_interrupted"].includes(item.status);
-    if (action === "cancel" && live) {
+    if (action === "cancel" && (live || item.isBatch)) {
+      // Cancelling a batch throws away the progress of every part at once, so it says how many
+      // and how much rather than asking about "this download" as though it were one file.
       const sure = await confirmDialog({
-        title: "Cancel this download?",
-        body: `${item.filename} will stop. Partial data stays on disk and a retry can pick it back up.`,
-        confirmLabel: "Cancel download",
+        title: item.isBatch ? `Cancel all ${item.members.length} files?` : "Cancel this download?",
+        body: item.isBatch
+          ? `${item.filename} will stop, including the ${item.totals.done} already finished. Partial data stays on disk and a retry can pick it back up.`
+          : `${item.filename} will stop. Partial data stays on disk and a retry can pick it back up.`,
+        confirmLabel: item.isBatch ? "Cancel the batch" : "Cancel download",
         cancelLabel: "Keep downloading",
         tone: "danger"
       });
@@ -297,7 +375,9 @@ function actionButton(label, action, item) {
 
     button.disabled = true;
     try {
-      if (action === "open" || action === "reveal") await openDownloadTarget(item, action === "reveal");
+      if (item.isBatch) {
+        await runBatchAction(item, action, label);
+      } else if (action === "open" || action === "reveal") await openDownloadTarget(item, action === "reveal");
       else if (action === "cancel" && !live) {
         // On a dead transfer this button reads "Remove": the user is clearing the entry,
         // so take it off the list now rather than leaving a card that waits for a poll.
@@ -347,6 +427,7 @@ function createCard(item) {
     detailResume: card.querySelector(".detail-resume"),
     detailRawRow: card.querySelector(".detail-raw-row"),
     detailRaw: card.querySelector(".detail-raw"),
+    memberList: card.querySelector(".member-list"),
     actions: card.querySelector(".download-actions"),
     actionsKey: null
   };
@@ -358,13 +439,66 @@ function createCard(item) {
   return entry;
 }
 
+/**
+ * Lists a batch's parts inside its expanded card.
+ *
+ * Compact rows rather than nested cards: fifty full cards inside one card is the mess the
+ * grouping exists to prevent. Only a broken part gets a control, because a broken part is the
+ * only one a person needs to do something about individually.
+ */
+function renderMembers(entry, item) {
+  entry.memberList.replaceChildren(...item.members.map((member) => {
+    const row = document.createElement("li");
+    row.className = "member";
+    row.dataset.status = member.status;
+
+    const name = document.createElement("span");
+    name.className = "member-name";
+    name.textContent = member.filename;
+    name.title = member.source_url || member.filename;
+
+    const state = document.createElement("span");
+    state.className = "member-state";
+    state.textContent = member.status === "active"
+      ? `${Math.round(progressPercent(member.completed_bytes, member.total_bytes))}%`
+      : statusLabel(member);
+
+    row.append(name, state);
+
+    if (["failed", "cancelled"].includes(member.status)) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "quiet member-retry";
+      retry.textContent = "Retry";
+      retry.setAttribute("aria-label", `Retry ${member.filename}`);
+      retry.addEventListener("click", async () => {
+        retry.disabled = true;
+        try {
+          const updated = await bridge.invoke("control_download", { downloadId: member.id, action: "retry" });
+          downloads = downloads.filter((existing) => existing.id !== member.id);
+          downloads.unshift(updated);
+          render();
+          toast(`Retrying ${member.filename}`, { tone: "info" });
+        } catch (error) {
+          toast(`Could not retry ${member.filename}: ${error.message ?? error}`, { tone: "error" });
+        } finally {
+          if (retry.isConnected) retry.disabled = false;
+        }
+      });
+      row.append(retry);
+    }
+    return row;
+  }));
+}
+
 function updateCard(entry, item) {
   const percent = progressPercent(item.completed_bytes, item.total_bytes);
   const label = statusLabel(item);
   const rounded = Math.round(percent);
   const dead = ["failed", "cancelled"].includes(item.status);
 
-  entry.kind.textContent = kindGlyph(kindOf(item.filename));
+  // A batch takes the glyph of what it holds — fifty .rar parts are a compressed batch.
+  entry.kind.textContent = kindGlyph(kindOf(item.isBatch ? item.members[0].filename : item.filename));
   entry.filename.textContent = item.filename;
   entry.filename.title = item.filename;
   entry.state.textContent = label;
@@ -382,9 +516,13 @@ function updateCard(entry, item) {
   // mystery control, so show nothing at all.
   entry.percent.hidden = dead;
   entry.percent.textContent = dead ? "" : sizeKnown ? `${rounded}%` : "—";
-  entry.size.textContent = sizeKnown
-    ? `${formatBytes(item.completed_bytes)} of ${formatBytes(item.total_bytes)}`
-    : `${formatBytes(item.completed_bytes)} so far`;
+  // A batch counts files, not just bytes. "31.2 GB of 100 GB" does not answer the question
+  // someone waiting on a fifty-part download actually has, which is how many parts are left.
+  entry.size.textContent = item.isBatch
+    ? `${batchProgressLabel(item.totals)}${sizeKnown ? ` · ${formatBytes(item.completed_bytes)} of ${formatBytes(item.total_bytes)}` : ""}`
+    : sizeKnown
+      ? `${formatBytes(item.completed_bytes)} of ${formatBytes(item.total_bytes)}`
+      : `${formatBytes(item.completed_bytes)} so far`;
   entry.speed.textContent = item.status === "active" && item.bytes_per_second > 0
     ? `${formatBytes(item.bytes_per_second)}/s`
     : "—";
@@ -426,7 +564,9 @@ function updateCard(entry, item) {
     entry.detailResume.textContent = item.num_pieces > 1 ? "Supported" : "Not reported";
     entry.detailRawRow.hidden = !item.error?.message;
     entry.detailRaw.textContent = item.error?.message ?? "";
+    if (item.isBatch) renderMembers(entry, item);
   }
+  entry.memberList.hidden = !(isOpen && item.isBatch);
 
   // Replacing the buttons destroys keyboard focus, so only do it when the actions change.
   const actions = actionsFor(item);
@@ -443,10 +583,88 @@ function updateCard(entry, item) {
   if (pendingFocusId === item.id) pendingFocusId = null;
 }
 
+/* ── Batches: many transfers, one row ───────────────────────────────────── */
+
+/**
+ * Builds the aggregate item that stands in for a whole batch.
+ *
+ * Deliberately shaped like an ordinary download, so the card renderer, the segmented bar, the
+ * sort and the date shelves all keep working unchanged. The batch's identity is the card's id,
+ * which is what lets the reconciler treat it as one thing that persists across polls.
+ */
+function aggregateBatch(batchId, members) {
+  const totals = batchTotals(members);
+  const remaining = totals.total_bytes - totals.completed_bytes;
+  const first = members[0];
+  const added = members.map((member) => member.added_at).filter(Boolean);
+  const finished = members.map((member) => member.completed_at).filter(Boolean);
+  return {
+    id: batchId,
+    batch_id: batchId,
+    isBatch: true,
+    members,
+    totals,
+    filename: first.batch_name || "Batch",
+    status: aggregateStatus(members),
+    // An unknown total anywhere makes the sum a floor rather than a figure, and the card
+    // already knows how to say "size unknown" rather than draw a confident bar.
+    total_bytes: totals.sizeKnown ? totals.total_bytes : 0,
+    completed_bytes: totals.completed_bytes,
+    bytes_per_second: totals.bytes_per_second,
+    eta_seconds: totals.bytes_per_second > 0 && remaining > 0
+      ? Math.round(remaining / totals.bytes_per_second)
+      : null,
+    connections: totals.connections,
+    num_pieces: totals.count,
+    bitfield: "",
+    source_url: first.source_url,
+    directory: first.directory,
+    // Only when every part is waiting does the window explain the whole card. One part started
+    // by hand means the batch is moving, whatever the rest are doing.
+    scheduled: totals.count > 0 && totals.scheduled === totals.count,
+    added_at: added.length ? Math.min(...added) : undefined,
+    // A batch finishes when its last part does, so an unfinished one has no completion date.
+    completed_at: finished.length === members.length && members.length > 0
+      ? Math.max(...finished)
+      : undefined
+  };
+}
+
+/** The queue's rows: loose downloads as themselves, batch members collapsed into one each. */
+function groupIntoRows(items) {
+  const members = new Map();
+  const rows = [];
+  for (const item of items) {
+    if (!item.batch_id) {
+      rows.push(item);
+      continue;
+    }
+    let group = members.get(item.batch_id);
+    if (!group) {
+      group = [];
+      members.set(item.batch_id, group);
+      // A placeholder holds the batch's position at its first member's place in the queue.
+      rows.push({ batchPlaceholder: item.batch_id });
+    }
+    group.push(item);
+  }
+  return rows.map((row) =>
+    row.batchPlaceholder ? aggregateBatch(row.batchPlaceholder, members.get(row.batchPlaceholder)) : row
+  );
+}
+
 /* ── Filtering and rendering ────────────────────────────────────────────── */
 
 function matchesFilter(item, active) {
   if (active === "all") return true;
+  // A batch answers for its parts: searching Programs should find the batch of installers, and
+  // Failed should surface a batch with a broken part in it even while the rest still runs.
+  if (item.isBatch) {
+    if (active.startsWith("type:")) {
+      return item.members.some((member) => kindOf(member.filename) === active.slice(5));
+    }
+    if (active === "failed") return item.totals.failed > 0;
+  }
   if (active.startsWith("type:")) return kindOf(item.filename) === active.slice(5);
   if (active === "active") return item.status === "active" || item.status === "queued";
   if (active === "failed") return item.status === "failed";
@@ -457,8 +675,12 @@ function matchesFilter(item, active) {
 
 function matchesSearch(item) {
   if (!searchQuery) return true;
-  const haystack = `${item.filename} ${item.source_url ?? ""}`.toLowerCase();
-  return haystack.includes(searchQuery);
+  // Searching a part's name has to find the batch holding it — otherwise the grouping hides
+  // the very file the user is looking for.
+  const haystack = item.isBatch
+    ? `${item.filename} ${item.members.map((member) => `${member.filename} ${member.source_url ?? ""}`).join(" ")}`
+    : `${item.filename} ${item.source_url ?? ""}`;
+  return haystack.toLowerCase().includes(searchQuery);
 }
 
 /** A download's place on the calendar: when it finished, or failing that, when it started. */
@@ -478,15 +700,17 @@ function matchesDate(item) {
   return true;
 }
 
-function updateCounts() {
-  const counts = { all: downloads.length };
+// Counts are of rows, not of transfers: the sidebar has to agree with what the queue shows, and
+// a batch is one card. "50 downloading" beside a single visible card is a sidebar that lies.
+function updateCounts(rows) {
+  const counts = { all: rows.length };
   for (const name of ["active", "paused", "completed", "failed"]) {
-    counts[name] = downloads.filter((item) => matchesFilter(item, name)).length;
+    counts[name] = rows.filter((item) => matchesFilter(item, name)).length;
   }
   // "other" included: every download must be reachable through some type filter, or the
   // sidebar's arithmetic quietly stops adding up to the total.
   for (const kind of [...Object.keys(KINDS), "other"]) {
-    counts[`type:${kind}`] = downloads.filter((item) => kindOf(item.filename) === kind).length;
+    counts[`type:${kind}`] = rows.filter((item) => matchesFilter(item, `type:${kind}`)).length;
   }
   document.querySelectorAll("[data-count]").forEach((node) => {
     node.textContent = String(counts[node.dataset.count] ?? 0);
@@ -539,8 +763,11 @@ function groupHeader(label) {
 // Reconciles by download id and mutates cards in place. A full rebuild would destroy the
 // button a keyboard user is standing on every time a progress event arrives.
 function render() {
+  // Group before filtering, so a batch is judged as the one thing the user sees rather than
+  // appearing half-populated whenever a filter excludes some of its parts.
+  const rows = groupIntoRows(downloads);
   const visible = orderDownloads(
-    downloads.filter((item) => matchesFilter(item, filter) && matchesSearch(item) && matchesDate(item))
+    rows.filter((item) => matchesFilter(item, filter) && matchesSearch(item) && matchesDate(item))
   );
   const keep = new Set(visible.map((item) => item.id));
 
@@ -605,7 +832,7 @@ function render() {
       elements.emptyHint.textContent = "Add a URL, or copy a link and Sandwich will offer to fetch it.";
     }
   }
-  updateCounts();
+  updateCounts(rows);
   updateThroughput();
 
   // Bulk failure controls only exist while there is a failure to act on.
@@ -661,12 +888,86 @@ elements.openAdd.addEventListener("click", () => {
   elements.intake.hidden = false;
   // First run lands on the decision still to make; once a folder is set it sticks, so
   // returning users go straight to the URL without paying a click for the new field order.
-  if (destination) elements.url.focus();
-  else elements.chooseFolder.focus();
+  if (!destination) elements.chooseFolder.focus();
+  else if (intakeMode === "many") elements.batchInput.focus();
+  else elements.url.focus();
 });
 elements.closeAdd.addEventListener("click", () => {
   elements.intake.hidden = true;
   elements.openAdd.focus();
+});
+
+/* ── One link or several ────────────────────────────────────────────────── */
+
+let intakeMode = "single";
+
+function setIntakeMode(mode) {
+  intakeMode = mode;
+  const many = mode === "many";
+  elements.manyMode.hidden = !many;
+  elements.singleMode.hidden = many;
+  elements.modeMany.classList.toggle("is-selected", many);
+  elements.modeSingle.classList.toggle("is-selected", !many);
+  elements.modeMany.setAttribute("aria-pressed", String(many));
+  elements.modeSingle.setAttribute("aria-pressed", String(!many));
+  showError("");
+  if (many) {
+    refreshBatchPreview();
+    elements.batchInput.focus();
+  } else {
+    elements.url.focus();
+  }
+}
+
+elements.modeSingle.addEventListener("click", () => setIntakeMode("single"));
+elements.modeMany.addEventListener("click", () => setIntakeMode("many"));
+
+// The most recent preview the backend returned, so submitting does not have to guess what the
+// user was shown.
+let batchPreview = null;
+
+async function refreshBatchPreview() {
+  const input = elements.batchInput.value;
+  try {
+    batchPreview = await bridge.invoke("preview_batch", { input });
+  } catch {
+    batchPreview = null;
+  }
+  const summary = describePreview(batchPreview);
+  elements.batchHeadline.textContent = summary.headline;
+  elements.batchDetail.textContent = summary.detail;
+  elements.batchState.dataset.tone = summary.tone;
+  elements.submitBatch.disabled = !batchPreview?.links?.length;
+
+  // Which lines were skipped, not just how many. Three missing parts out of fifty is a
+  // question ("which three?") that a count alone cannot answer.
+  const rejected = batchPreview?.rejected ?? [];
+  elements.batchRejects.hidden = rejected.length === 0;
+  if (rejected.length > 0) {
+    elements.batchRejectsSummary.textContent =
+      `${rejected.length} line${rejected.length === 1 ? "" : "s"} will be skipped`;
+    elements.batchRejectList.replaceChildren(...rejected.map((entry) => {
+      const row = document.createElement("li");
+      const link = document.createElement("code");
+      link.textContent = entry.link;
+      const reason = document.createElement("span");
+      reason.className = "reject-reason";
+      reason.textContent = entry.reason;
+      row.append(link, reason);
+      return row;
+    }));
+  }
+  if (batchPreview?.suggested_name && !elements.batchName.value) {
+    elements.batchName.placeholder = batchPreview.suggested_name;
+  }
+}
+
+// Debounced: a fifty-line paste would otherwise ask the backend to expand and validate the
+// whole list on every keystroke.
+let previewTimer = null;
+elements.batchInput.addEventListener("input", () => {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(refreshBatchPreview, 150);
 });
 
 elements.form.addEventListener("submit", async (event) => {
@@ -677,24 +978,60 @@ elements.form.addEventListener("submit", async (event) => {
     elements.chooseFolder.focus();
     return;
   }
-  const submit = elements.form.querySelector("button[type=submit]");
+  const submit = intakeMode === "many" ? elements.submitBatch : elements.submitSingle;
   submit.disabled = true;
   try {
-    const snapshot = await bridge.invoke("submit_url", {
-      url: elements.url.value,
-      destination,
-      organizeByType: elements.organize.checked
-    });
-    mergeDownload(snapshot, `${snapshot.filename} added to the queue.`);
-    toast(`Queued ${snapshot.filename}`, { tone: "success" });
-    elements.url.value = "";
-    elements.url.focus();
+    if (intakeMode === "many") await submitBatch();
+    else await submitSingle();
   } catch (error) {
     showError(error.message ?? String(error));
   } finally {
     submit.disabled = false;
   }
 });
+
+async function submitSingle() {
+  const snapshot = await bridge.invoke("submit_url", {
+    url: elements.url.value,
+    destination,
+    organizeByType: elements.organize.checked
+  });
+  mergeDownload(snapshot, `${snapshot.filename} added to the queue.`);
+  toast(`Queued ${snapshot.filename}`, { tone: "success" });
+  elements.url.value = "";
+  elements.url.focus();
+}
+
+async function submitBatch() {
+  const result = await bridge.invoke("submit_batch", {
+    input: elements.batchInput.value,
+    destination,
+    organizeByType: elements.organize.checked,
+    name: elements.batchName.value.trim() || null
+  });
+  for (const snapshot of result.queued ?? []) {
+    const index = downloads.findIndex((entry) => entry.id === snapshot.id);
+    if (index < 0) downloads.unshift(snapshot); else downloads[index] = snapshot;
+  }
+  render();
+
+  const count = result.queued?.length ?? 0;
+  elements.queueStatus.textContent = `${result.name}: ${count} files added to the queue.`;
+  toast(`Queued ${count} file${count === 1 ? "" : "s"} as ${result.name}`, { tone: "success" });
+  // The engine refusing some addresses after policy passed them is rare and worth saying out
+  // loud — the batch is real but incomplete, and only the user can decide what to do.
+  if (result.failed?.length) {
+    toast(
+      `${result.failed.length} address${result.failed.length === 1 ? "" : "es"} in ${result.name} could not be queued.`,
+      { tone: "error" }
+    );
+  }
+
+  elements.batchInput.value = "";
+  elements.batchName.value = "";
+  await refreshBatchPreview();
+  elements.batchInput.focus();
+}
 
 let dismissSettingsToast = null;
 let settingsSaveQueue = Promise.resolve();
